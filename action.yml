@@ -28,49 +28,116 @@ inputs:
   local-port:
     description: 'Local port'
     required: true
+  known-hosts:
+    description: 'Contents of ~/.ssh/known_hosts (optional)'
+    required: false
+    default: ''
+  strict-host-key-checking:
+    description: 'SSH StrictHostKeyChecking (yes/no)'
+    required: false
+    default: 'no'
 
 runs:
   using: 'composite'
   steps:
     - name: Write SSH key to file
-      uses: 'actions/github-script@v6'
-      with:
-        script: |
-          const {writeFile} = require('fs').promises;
-          const {join} = require('path');
-          
-          try {
-            const key = core.getInput('ssh-key');
-            await writeFile('user_key', key, { encoding: 'utf8', mode: 0o400 });
-          } catch (error) {
-            core.setFailed(error.message);
-          }
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh-key }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$SSH_KEY" ]]; then
+          echo "::error::ssh-key input is empty"
+          exit 1
+        fi
+        install -m 600 /dev/null "$RUNNER_TEMP/user_key"
+        printf "%s\n" "$SSH_KEY" > "$RUNNER_TEMP/user_key"
+        chmod 400 "$RUNNER_TEMP/user_key"
 
     - name: Validate SSH key
       shell: bash
       run: |
-        ssh-keygen -y -e -f user_key
+        if ! ssh-keygen -y -f "$RUNNER_TEMP/user_key" >/dev/null 2>&1; then
+          echo "::error::Invalid SSH private key"
+          exit 1
+        fi
+
+    - name: Validate inputs
+      shell: bash
+      env:
+        SSH_PORT: ${{ inputs.ssh-port }}
+        LOCAL_PORT: ${{ inputs.local-port }}
+        REMOTE_PORT: ${{ inputs.remote-port }}
+      run: |
+        set -euo pipefail
+        for pair in "ssh-port:$SSH_PORT" "local-port:$LOCAL_PORT" "remote-port:$REMOTE_PORT"; do
+          name="${pair%%:*}"
+          value="${pair#*:}"
+          if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -lt 1 || "$value" -gt 65535 ]]; then
+            echo "::error::$name must be a number between 1 and 65535, got '$value'"
+            exit 1
+          fi
+        done
 
     - name: Start SSH port forwarding
       shell: bash
-      run: |       
-        # Start SSH forwarder
-        ssh -i user_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -N -L ${{ inputs.local-port }}:${{ inputs.remote-host }}:${{ inputs.remote-port }} -p ${{ inputs.ssh-port }} ${{ inputs.ssh-user }}@${{ inputs.ssh-host }} &
+      env:
+        INPUT_SSH_HOST: ${{ inputs.ssh-host }}
+        INPUT_SSH_PORT: ${{ inputs.ssh-port }}
+        INPUT_SSH_USER: ${{ inputs.ssh-user }}
+        INPUT_REMOTE_HOST: ${{ inputs.remote-host }}
+        INPUT_REMOTE_PORT: ${{ inputs.remote-port }}
+        INPUT_LOCAL_PORT: ${{ inputs.local-port }}
+        INPUT_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        INPUT_STRICT_HOST_KEY_CHECKING: ${{ inputs.strict-host-key-checking }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
 
-        # wait until connections are accepted
+        # configure known_hosts
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        if [[ -n "$INPUT_KNOWN_HOSTS" ]]; then
+          printf "%s\n" "$INPUT_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+        fi
+
+        # build SSH options
+        SSH_OPTS="-o ExitOnForwardFailure=yes"
+        if [[ "$INPUT_STRICT_HOST_KEY_CHECKING" == "no" ]]; then
+          SSH_OPTS+=" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        fi
+
+        # launch port forward in background
+        ssh $SSH_OPTS -i "$RUNNER_TEMP/user_key" \
+            -N -L "$INPUT_LOCAL_PORT:$INPUT_REMOTE_HOST:$INPUT_REMOTE_PORT" \
+            -p "$INPUT_SSH_PORT" \
+            "$INPUT_SSH_USER@$INPUT_SSH_HOST" &
+        echo "$!" > "$RUNNER_TEMP/ssh_tunnel.pid"
+
+        # wait until the forwarded port accepts connections
         sleep 3
-        isready=0
+        isready=1
         for i in {1..10}; do
-          echo "Wait for connections to be ready ... $i/10"
-          (${{ github.action_path }}/wait-for-it.sh --quiet --timeout=3 --host=127.0.0.1 --port=${{ inputs.local-port }} || exit $?) && true # escape bash's pipefail
-          isready=$?
-          if [[ $isready -eq 0 ]]; then
+          echo "Waiting for tunnel to be ready ... $i/10"
+          if "$ACTION_PATH/wait-for-it.sh" --quiet --timeout=3 --host=127.0.0.1 --port="$INPUT_LOCAL_PORT"; then
+            isready=0
             break
           fi
           sleep 2
         done
 
-        # exit with error code if we couldn't connect
         if [[ $isready -ne 0 ]]; then
-          exit $isready 
+          echo "::error::SSH tunnel failed to become ready"
+          exit 1
         fi
+
+    - name: Clean up
+      if: always()
+      shell: bash
+      run: |
+        if [[ -f "$RUNNER_TEMP/ssh_tunnel.pid" ]]; then
+          kill "$(cat "$RUNNER_TEMP/ssh_tunnel.pid")" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/ssh_tunnel.pid"
+        fi
+        rm -f "$RUNNER_TEMP/user_key"
